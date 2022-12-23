@@ -3,7 +3,7 @@ $(error Please define WONDERFUL_TOOLCHAIN to point to the location of the Wonder
 endif
 include $(WONDERFUL_TOOLCHAIN)/i8086/wswan.mk
 
-BINFILE := Rustyt.vgm
+BINFILE := Rusty.vgm
 
 TARGET := $(notdir $(shell pwd)).wsc
 OBJDIR := obj
