@@ -86,9 +86,11 @@ type CommandWait struct {
 }
 
 type CommandPlaySample struct {
-	Sample  *Sample
-	Repeat  bool
-	Reverse bool
+	Sample       *Sample
+	CustomOffset uint16
+	CustomLength uint16
+	Repeat       bool
+	Reverse      bool
 }
 
 type CommandJump struct {
@@ -284,6 +286,54 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 		case 0x92:
 			stream := getDacStreamReader()
 			binary.Read(r, binary.LittleEndian, &stream.Frequency)
+		case 0x93:
+			// start stream slow
+			stream := getDacStreamReader()
+			var offset uint32
+			var flags uint8
+			var length uint32
+			binary.Read(r, binary.LittleEndian, &offset)
+			binary.Read(r, binary.LittleEndian, &flags)
+			binary.Read(r, binary.LittleEndian, &length)
+			if !DisablePCM {
+				cmd := CommandPlaySample{}
+				found := false
+				blockId := uint16(0)
+				for i, block := range pcmSampleData {
+					if offset >= block.OrigOffset && (offset+length) <= (block.OrigOffset+block.OrigLength) {
+						found = true
+						blockId = uint16(i)
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("could not find sample data for offset %d", offset)
+				}
+				sample, isNew := convertedSamples.ConvertSample(blockId, stream.Frequency, pcmSampleData[blockId])
+				if isNew {
+					song.Samples = append(song.Samples, sample)
+				}
+				sampleRatio := float64(1.0)
+				if !DisableResampling {
+					sampleRatio = float64(sample.Frequency) / float64(stream.Frequency)
+				}
+				cmd.Sample = sample
+				cmd.CustomOffset = uint16(float64(offset-uint32(pcmSampleData[blockId].OrigOffset)) * sampleRatio)
+				cmd.CustomLength = uint16(float64(length) * sampleRatio)
+				switch flags & 0x03 {
+				case 0:
+				case 3:
+				case 1:
+					// TODO: "number of commands" not supported
+					break
+				case 2:
+					length *= 44
+				}
+				cmd.Repeat = (flags & 0x80) != 0
+				cmd.Reverse = (flags & 0x10) != 0
+				song.Commands = append(song.Commands, &cmd)
+			}
+			requestSampleReset = true
 		case 0x94:
 			// stop stream
 			if !DisablePCM {
@@ -304,12 +354,12 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 				}
 				cmd := CommandPlaySample{}
 				sample, isNew := convertedSamples.ConvertSample(blockId, stream.Frequency, pcmSampleData[blockId])
-				cmd.Sample = sample
 				if isNew {
 					song.Samples = append(song.Samples, sample)
 				}
+				cmd.Sample = sample
 				cmd.Repeat = (flags & 0x01) != 0
-				cmd.Reverse = (flags & 0x04) != 0
+				cmd.Reverse = (flags & 0x10) != 0
 				song.Commands = append(song.Commands, &cmd)
 			}
 			requestSampleReset = true
@@ -526,8 +576,11 @@ func main() {
 					cmdBuffer = append(cmdBuffer, 0xFB, 0x00)
 				} else {
 					ctrl := uint8(0x80)
-					pos := uint16(cmd.Sample.FilePosition)
+					pos := uint16(cmd.Sample.FilePosition + uint32(cmd.CustomOffset))
 					len := uint16(len(*cmd.Sample.Data))
+					if cmd.CustomLength > 0 {
+						len = cmd.CustomLength
+					}
 					if cmd.Reverse {
 						pos += len - 1
 						ctrl |= 0x40
