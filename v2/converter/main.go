@@ -569,6 +569,8 @@ func main() {
 		}
 		songWriter.Write([]byte{0xFA})
 		writeBankPosition(songWriter, position, loopPosition)
+		filePos, _ := songWriter.Seek(0, io.SeekCurrent)
+		position = uint32(filePos)
 	}
 
 	if BuildTestROM {
