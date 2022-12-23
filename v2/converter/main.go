@@ -34,6 +34,8 @@ import (
 	"github.com/oov/audio/resampler"
 )
 
+var Emit0xFC = true
+var Emit0xEF = true
 var Enable24KHzSamples = false
 var DisablePCM = false
 var DisableResampling = false
@@ -81,8 +83,7 @@ type CommandWritePort struct {
 }
 
 type CommandWait struct {
-	Length            uint32
-	NewSamplePosition uint32
+	Length uint32
 }
 
 type CommandPlaySample struct {
@@ -97,9 +98,15 @@ type CommandJump struct {
 	TargetSample uint32
 }
 
+type CommandFrame struct {
+	Position  uint32
+	Commands  []interface{}
+	LoopFrame bool
+}
+
 type Song struct {
 	Samples      []*Sample
-	Commands     []interface{}
+	Commands     []*CommandFrame
 	LoopPosition uint32
 }
 
@@ -225,6 +232,10 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 	}
 
 	requestSampleReset := false
+	frame := CommandFrame{}
+	if newSamplePos == song.LoopPosition {
+		frame.LoopFrame = true
+	}
 	for running {
 		// check for loop offset
 		filePos, err := r.Seek(0, io.SeekCurrent)
@@ -238,8 +249,8 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 
 		// parse command
 		var lastCommand interface{} = nil
-		if len(song.Commands) > 0 {
-			lastCommand = song.Commands[len(song.Commands)-1]
+		if len(frame.Commands) > 0 {
+			lastCommand = frame.Commands[len(frame.Commands)-1]
 		}
 		var cmd uint8
 		if err := binary.Read(r, binary.LittleEndian, &cmd); err != nil {
@@ -331,13 +342,13 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 				}
 				cmd.Repeat = (flags & 0x80) != 0
 				cmd.Reverse = (flags & 0x10) != 0
-				song.Commands = append(song.Commands, &cmd)
+				frame.Commands = append(frame.Commands, &cmd)
 			}
 			requestSampleReset = true
 		case 0x94:
 			// stop stream
 			if !DisablePCM {
-				song.Commands = append(song.Commands, &CommandPlaySample{})
+				frame.Commands = append(frame.Commands, &CommandPlaySample{})
 			}
 			requestSampleReset = false
 			r.Seek(1, io.SeekCurrent)
@@ -360,7 +371,7 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 				cmd.Sample = sample
 				cmd.Repeat = (flags & 0x01) != 0
 				cmd.Reverse = (flags & 0x10) != 0
-				song.Commands = append(song.Commands, &cmd)
+				frame.Commands = append(frame.Commands, &cmd)
 			}
 			requestSampleReset = true
 		case 0xBC:
@@ -376,7 +387,7 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 				if addr == 0x10 && (data&0x20) == 0 && (data&0x02) != 0 && requestSampleReset {
 					// HACK: force stop sample here!
 					// this shouldn't take so much space :(
-					song.Commands = append(song.Commands, &CommandPlaySample{})
+					frame.Commands = append(frame.Commands, &CommandPlaySample{})
 					requestSampleReset = false
 				}
 			}
@@ -388,7 +399,7 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 					cmd.Data = append(cmd.Data, data)
 				}
 			} else {
-				song.Commands = append(song.Commands, &CommandWritePort{
+				frame.Commands = append(frame.Commands, &CommandWritePort{
 					addr, []byte{data},
 				})
 			}
@@ -404,7 +415,7 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 			if cmd, ok := lastCommand.(*CommandWriteMemory); ok && cmd.Address == uint16(int(addr)-len(cmd.Data)) && (addr&0x0F) != 0 {
 				cmd.Data = append(cmd.Data, data)
 			} else {
-				song.Commands = append(song.Commands, &CommandWriteMemory{
+				frame.Commands = append(frame.Commands, &CommandWriteMemory{
 					addr, []byte{data},
 				})
 			}
@@ -415,9 +426,15 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 			// TODO: support vblank mode
 			waitTime := ((newSamplePos-samplePos)*120 + 440) / 441
 			if waitTime > 0 {
-				song.Commands = append(song.Commands, &CommandWait{
-					waitTime, newSamplePos,
+				frame.Commands = append(frame.Commands, &CommandWait{
+					waitTime,
 				})
+				newFrame := frame
+				song.Commands = append(song.Commands, &newFrame)
+				frame = CommandFrame{}
+				if newSamplePos == song.LoopPosition {
+					frame.LoopFrame = true
+				}
 			}
 			samplePos = newSamplePos
 		}
@@ -531,94 +548,116 @@ func main() {
 	}
 	// start writing song data
 	wavetableCache := make(map[[16]byte]uint16)
+	frameCache := make([]*CommandFrame, 0)
+	appendCmd := func(cmdBuffer []byte) {
+		curBank := position >> 16
+		nextBank := (position + uint32(len(cmdBuffer)) + 1) >> 16
+		if curBank != nextBank {
+			songWriter.Write([]byte{0xF7})
+			position += 1
+			for (position & 0xFFFF) != 0 {
+				songWriter.Write([]byte{0xFF})
+				position += 1
+			}
+			wavetableCache = make(map[[16]byte]uint16)
+			frameCache = make([]*CommandFrame, 0)
+		}
+		songWriter.Write(cmdBuffer)
+		filePos, _ := songWriter.Seek(0, io.SeekCurrent)
+		position = uint32(filePos)
+	}
 	for i := 0; i < len(data.Songs); i++ {
 		song := data.Songs[i]
 		loopPosition := position
 		songWriter.Seek(int64(i*3), io.SeekStart)
 		writeBankPosition(songWriter, 0, position)
 		songWriter.Seek(int64(position), io.SeekStart)
-		for _, cmdRaw := range song.Commands {
-			cmdBuffer := []byte{}
-			switch cmd := cmdRaw.(type) {
-			case *CommandWritePort:
-				if len(cmd.Data) == 2 {
-					cmdBuffer = append(cmdBuffer, append([]byte{0x60 + cmd.Address}, cmd.Data...)...)
-				} else if len(cmd.Data) == 1 {
-					cmdBuffer = append(cmdBuffer, append([]byte{0x40 + cmd.Address}, cmd.Data...)...)
-				} else {
-					panic(fmt.Errorf("unknown port write data length %+v", cmd))
-				}
-			case *CommandWriteMemory:
-				if (cmd.Address&0x000F) == 0 && cmd.Address < 0x40 && len(cmd.Data) == 16 && (position&0xFFFF) < 0xFFE8 {
-					key := *(*[16]byte)(cmd.Data)
-					if pos, ok := wavetableCache[key]; ok {
-						cmdBuffer = append(cmdBuffer, uint8(0xFC+(cmd.Address>>4)), uint8(pos), uint8(pos>>8))
+
+		for _, frame := range song.Commands {
+			if frame.LoopFrame {
+				filePos, _ := songWriter.Seek(0, io.SeekCurrent)
+				loopPosition = uint32(filePos)
+			}
+			found := false
+			if Emit0xEF {
+				for _, otherFrame := range frameCache {
+					if reflect.DeepEqual(otherFrame.Commands, frame.Commands) {
+						found = true
+						appendCmd([]byte{0xEF, uint8(otherFrame.Position), uint8(otherFrame.Position >> 8)})
 						break
-					} else {
-						wavetableCache[key] = uint16(position + 2)
 					}
 				}
-				cmdBuffer = append(cmdBuffer, append([]byte{uint8(cmd.Address), uint8(len(cmd.Data))}, cmd.Data...)...)
-			case *CommandWait:
-				if cmd.Length >= 256 {
-					cmdBuffer = append(cmdBuffer, 0xF9, uint8(cmd.Length), uint8(cmd.Length>>8))
-				} else if cmd.Length > 7 {
-					cmdBuffer = append(cmdBuffer, 0xF8, uint8(cmd.Length))
-				} else if cmd.Length > 0 {
-					cmdBuffer = append(cmdBuffer, 0xEF+uint8(cmd.Length))
-				}
-				if cmd.NewSamplePosition == song.LoopPosition {
-					filePos, _ := songWriter.Seek(0, io.SeekCurrent)
-					loopPosition = uint32(filePos)
-				}
-			case *CommandPlaySample:
-				if cmd.Sample == nil {
-					cmdBuffer = append(cmdBuffer, 0xFB, 0x00)
-				} else {
-					ctrl := uint8(0x80)
-					pos := uint16(cmd.Sample.FilePosition + uint32(cmd.CustomOffset))
-					len := uint16(len(*cmd.Sample.Data))
-					if cmd.CustomLength > 0 {
-						len = cmd.CustomLength
-					}
-					if cmd.Reverse {
-						pos += len - 1
-						ctrl |= 0x40
-					}
-					if cmd.Repeat {
-						ctrl |= 0x08
-					}
-					switch cmd.Sample.Frequency {
-					case 4000:
-						break
-					case 6000:
-						ctrl |= 0x01
-					case 12000:
-						ctrl |= 0x02
-					case 24000:
-						ctrl |= 0x03
+			}
+			if !found {
+				frame.Position = position
+				frameCache = append(frameCache, frame)
+				for _, cmdRaw := range frame.Commands {
+					cmdBuffer := []byte{}
+					switch cmd := cmdRaw.(type) {
+					case *CommandWritePort:
+						if len(cmd.Data) == 2 {
+							cmdBuffer = append(cmdBuffer, append([]byte{0x60 + cmd.Address}, cmd.Data...)...)
+						} else if len(cmd.Data) == 1 {
+							cmdBuffer = append(cmdBuffer, append([]byte{0x40 + cmd.Address}, cmd.Data...)...)
+						} else {
+							panic(fmt.Errorf("unknown port write data length %+v", cmd))
+						}
+					case *CommandWriteMemory:
+						if Emit0xFC && (cmd.Address&0x000F) == 0 && cmd.Address < 0x40 && len(cmd.Data) == 16 && (position&0xFFFF) < 0xFFE8 {
+							key := *(*[16]byte)(cmd.Data)
+							if pos, ok := wavetableCache[key]; ok {
+								cmdBuffer = append(cmdBuffer, uint8(0xFC+(cmd.Address>>4)), uint8(pos), uint8(pos>>8))
+								break
+							} else {
+								wavetableCache[key] = uint16(position + 2)
+							}
+						}
+						cmdBuffer = append(cmdBuffer, append([]byte{uint8(cmd.Address), uint8(len(cmd.Data))}, cmd.Data...)...)
+					case *CommandWait:
+						if cmd.Length >= 256 {
+							cmdBuffer = append(cmdBuffer, 0xF9, uint8(cmd.Length), uint8(cmd.Length>>8))
+						} else if cmd.Length > 7 {
+							cmdBuffer = append(cmdBuffer, 0xF8, uint8(cmd.Length))
+						} else if cmd.Length > 0 {
+							cmdBuffer = append(cmdBuffer, 0xEF+uint8(cmd.Length))
+						}
+					case *CommandPlaySample:
+						if cmd.Sample == nil {
+							cmdBuffer = append(cmdBuffer, 0xFB, 0x00)
+						} else {
+							ctrl := uint8(0x80)
+							pos := uint16(cmd.Sample.FilePosition + uint32(cmd.CustomOffset))
+							len := uint16(len(*cmd.Sample.Data))
+							if cmd.CustomLength > 0 {
+								len = cmd.CustomLength
+							}
+							if cmd.Reverse {
+								pos += len - 1
+								ctrl |= 0x40
+							}
+							if cmd.Repeat {
+								ctrl |= 0x08
+							}
+							switch cmd.Sample.Frequency {
+							case 4000:
+								break
+							case 6000:
+								ctrl |= 0x01
+							case 12000:
+								ctrl |= 0x02
+							case 24000:
+								ctrl |= 0x03
+							default:
+								panic(fmt.Errorf("unknown frequency %d", cmd.Sample.Frequency))
+							}
+							cmdBuffer = append(cmdBuffer, 0xFB, ctrl, uint8(pos), uint8(pos>>8), uint8(len), uint8(len>>8))
+						}
 					default:
-						panic(fmt.Errorf("unknown frequency %d", cmd.Sample.Frequency))
+						panic(fmt.Errorf("unknown command type %+v", cmd))
 					}
-					cmdBuffer = append(cmdBuffer, 0xFB, ctrl, uint8(pos), uint8(pos>>8), uint8(len), uint8(len>>8))
+					appendCmd(cmdBuffer)
 				}
-			default:
-				panic(fmt.Errorf("unknown command type %+v", cmd))
 			}
-			curBank := position >> 16
-			nextBank := (position + uint32(len(cmdBuffer)) + 1) >> 16
-			if curBank != nextBank {
-				songWriter.Write([]byte{0xF7})
-				position += 1
-				for (position & 0xFFFF) != 0 {
-					songWriter.Write([]byte{0xFF})
-					position += 1
-				}
-				wavetableCache = make(map[[16]byte]uint16)
-			}
-			songWriter.Write(cmdBuffer)
-			filePos, _ := songWriter.Seek(0, io.SeekCurrent)
-			position = uint32(filePos)
 		}
 		songWriter.Write([]byte{0xFA})
 		writeBankPosition(songWriter, position, loopPosition)
