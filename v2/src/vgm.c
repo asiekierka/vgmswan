@@ -19,6 +19,7 @@ uint16_t vgmswan_play(vgmswan_state_t *state) {
     uint8_t bank_backup = inportb(IO_BANK_ROM0);
     outportb(IO_BANK_ROM0, state->bank);
     uint8_t __far* ptr = MK_FP(0x2000, state->pos);
+    uint16_t addrPrefix = (inportb(IO_SND_WAVE_BASE) << 6);;
     uint16_t result = 0;
     while (result == 0) {
         // play routine! <3
@@ -26,7 +27,7 @@ uint16_t vgmswan_play(vgmswan_state_t *state) {
         switch (cmd & 0xE0) {
         case 0x00:
         case 0x20: { // memory write
-            uint16_t addr = cmd + (inportb(IO_SND_WAVE_BASE) << 6);
+            uint16_t addr = cmd | addrPrefix;
             uint8_t len = *(ptr++);
             memcpy((uint8_t*) addr, ptr, len);
             ptr += len;
@@ -79,7 +80,14 @@ uint16_t vgmswan_play(vgmswan_state_t *state) {
                     outportb(IO_SDMA_CTRL, ctrl);
                 }
             } break;
-            // TODO: 0xFC-0xFF
+            case 0xFC:
+            case 0xFD:
+            case 0xFE:
+            case 0xFF: {
+                uint16_t addr = ((cmd - 0xFC) << 4) | addrPrefix;
+                uint8_t __far* mem_ptr = MK_FP(0x2000, *((uint16_t __far*) ptr)); ptr += 2;
+                memcpy((uint8_t*) addr, mem_ptr, 16);
+            } break;
             }
         }
         }

@@ -3,9 +3,7 @@ $(error Please define WONDERFUL_TOOLCHAIN to point to the location of the Wonder
 endif
 include $(WONDERFUL_TOOLCHAIN)/i8086/wswan.mk
 
-BINFILE := converter/output.bin
-
-TARGET := $(notdir $(shell pwd)).wsc
+TARGET := converter/engine.bin
 OBJDIR := obj
 SRCDIRS := src
 RESDIRS := res
@@ -31,7 +29,7 @@ vpath %.png $(RESDIRS)
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(SWANLINK) -v -o $@ -a $(BINFILE) --heap-length 0x1800 --color --output-elf $@.elf --linker-args $(LDFLAGS) $(WF_CRT0) $(OBJECTS) $(LIBS)
+	$(SWANLINK) -v -o $@ --trim --heap-length 0x1800 --color --output-elf $@.elf --linker-args $(LDFLAGS) $(WF_CRT0) $(OBJECTS) $(LIBS)
 
 $(OBJDIR)/%.png.c: %.png | $(OBJDIR)
 	$(SUPERFAMICONV) tiles -i $(basename $<).png -p $(basename $<).json -M ws -D -F -d $(OBJDIR)/$(notdir $<).bin

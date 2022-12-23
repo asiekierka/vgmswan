@@ -1,18 +1,60 @@
+// Copyright (c) 2022 Adrian Siekierka
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package main
 
 import (
+	_ "embed"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
 
 	"github.com/asiekierka/vgmswan/v2/converter/vgm"
+	"github.com/oov/audio/resampler"
 )
 
+var Enable24KHzSamples = false
+var DisablePCM = false
+var DisableResampling = false
+var BuildTestROM = false
+var OutputFilename = ""
+
+//go:embed engine.bin
+var engineBin []byte
+var romSizeToHeaderValue = map[int]byte{
+	128 * 1024:       0,
+	256 * 1024:       1,
+	512 * 1024:       2,
+	1024 * 1024:      3,
+	2 * 1024 * 1024:  4,
+	4 * 1024 * 1024:  6,
+	8 * 1024 * 1024:  8,
+	16 * 1024 * 1024: 9,
+}
+
 type Sample struct {
-	Data         []byte
+	Data         *[]byte
 	FilePosition uint32
 	Frequency    uint32
 }
@@ -83,17 +125,59 @@ func (c *ConvertedSampleMap) ConvertSample(idx uint16, freq uint32, data PCMSamp
 	key := ConvertedSampleKey{
 		idx, freq,
 	}
-	// TODO: add resampling...
-	key.frequency = 12000
-	if sample, ok := c.data[key]; ok {
-		return sample, false
+	if DisableResampling {
+		key.frequency = 24000
+		if !Enable24KHzSamples || freq <= 16000 {
+			key.frequency = 12000
+			if freq <= 8000 {
+				key.frequency = 6000
+				if freq <= 4800 {
+					key.frequency = 4000
+				}
+			}
+		}
+
+		if sample, ok := c.data[key]; ok {
+			return sample, false
+		} else {
+			sample := Sample{}
+			sample.Frequency = key.frequency
+			sample.Data = &data.Data
+			c.data[key] = &sample
+			return &sample, true
+		}
 	} else {
-		// TODO: add resampling
-		sample := Sample{}
-		sample.Data = data.Data
-		sample.Frequency = 12000
-		c.data[key] = &sample
-		return &sample, true
+		if sample, ok := c.data[key]; ok {
+			return sample, false
+		} else {
+			// resample
+			sample := Sample{}
+			sample.Frequency = 12000
+			if freq <= 7000 {
+				sample.Frequency = 6000
+				if freq <= 4500 {
+					sample.Frequency = 4000
+				}
+			}
+
+			inputDataFloat := make([]float32, len(data.Data))
+			for i, s := range data.Data {
+				inputDataFloat[i] = (float32(s) - 127.5) / 127.5
+			}
+			outDataLen := int((uint64(len(data.Data)) * uint64(sample.Frequency)) / uint64(freq))
+			outputDataFloat := make([]float32, outDataLen)
+			resampler.Resample32(inputDataFloat, int(freq), outputDataFloat, int(sample.Frequency), 10)
+			outputData := make([]byte, outDataLen)
+			for i, s := range outputDataFloat {
+				outputData[i] = byte((s * 127.5) + 127.5)
+			}
+
+			fmt.Printf("resampled sample %d: %d Hz(%d bytes) to %d hz(%d bytes)\n", idx, freq, len(data.Data), sample.Frequency, outDataLen)
+
+			sample.Data = &outputData
+			c.data[key] = &sample
+			return &sample, true
+		}
 	}
 }
 
@@ -202,7 +286,10 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 			binary.Read(r, binary.LittleEndian, &stream.Frequency)
 		case 0x94:
 			// stop stream
-			song.Commands = append(song.Commands, &CommandPlaySample{})
+			if !DisablePCM {
+				song.Commands = append(song.Commands, &CommandPlaySample{})
+			}
+			requestSampleReset = false
 			r.Seek(1, io.SeekCurrent)
 		case 0x95:
 			// start stream fast
@@ -211,18 +298,20 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 			var flags uint8
 			binary.Read(r, binary.LittleEndian, &blockId)
 			binary.Read(r, binary.LittleEndian, &flags)
-			if int(blockId) >= len(pcmSampleData) {
-				return nil, fmt.Errorf("missing PCM data block %d", blockId)
+			if !DisablePCM {
+				if int(blockId) >= len(pcmSampleData) {
+					return nil, fmt.Errorf("missing PCM data block %d", blockId)
+				}
+				cmd := CommandPlaySample{}
+				sample, isNew := convertedSamples.ConvertSample(blockId, stream.Frequency, pcmSampleData[blockId])
+				cmd.Sample = sample
+				if isNew {
+					song.Samples = append(song.Samples, sample)
+				}
+				cmd.Repeat = (flags & 0x01) != 0
+				cmd.Reverse = (flags & 0x04) != 0
+				song.Commands = append(song.Commands, &cmd)
 			}
-			cmd := CommandPlaySample{}
-			sample, isNew := convertedSamples.ConvertSample(blockId, stream.Frequency, pcmSampleData[blockId])
-			cmd.Sample = sample
-			if isNew {
-				song.Samples = append(song.Samples, sample)
-			}
-			cmd.Repeat = (flags & 0x01) != 0
-			cmd.Reverse = (flags & 0x04) != 0
-			song.Commands = append(song.Commands, &cmd)
 			requestSampleReset = true
 		case 0xBC:
 			// WonderSwan write (I/O)
@@ -233,11 +322,13 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 				// skip these!
 				break
 			}
-			if addr == 0x10 && (data&0x20) == 0 && (data&0x02) != 0 && requestSampleReset {
-				// HACK: force stop sample here!
-				// this shouldn't take so much space :(
-				song.Commands = append(song.Commands, &CommandPlaySample{})
-				requestSampleReset = false
+			if !DisablePCM {
+				if addr == 0x10 && (data&0x20) == 0 && (data&0x02) != 0 && requestSampleReset {
+					// HACK: force stop sample here!
+					// this shouldn't take so much space :(
+					song.Commands = append(song.Commands, &CommandPlaySample{})
+					requestSampleReset = false
+				}
 			}
 			if cmd, ok := lastCommand.(*CommandWritePort); ok && len(cmd.Data) == 1 && (cmd.Address == addr-1 || cmd.Address == addr+1) {
 				if cmd.Address == addr+1 {
@@ -292,10 +383,30 @@ func writeBankPosition(w io.Writer, currentPosition uint32, writtenPosition uint
 	return err
 }
 
+func init() {
+	flag.BoolVar(&DisablePCM, "disable-pcm", false, "Disable PCM samples.")
+	flag.BoolVar(&DisableResampling, "disable-resampling", false, "Disable resampling.")
+	flag.BoolVar(&Enable24KHzSamples, "enable-24khz-samples", false, "Enable 24kHz samples.")
+	flag.BoolVar(&BuildTestROM, "t", false, "Output playback ROM.")
+	flag.StringVar(&OutputFilename, "o", "", "Output filename.")
+}
+
 func main() {
 	var data BankData
 
-	for _, songFilename := range os.Args[1:] {
+	flag.Parse()
+	if flag.NArg() <= 0 {
+		fmt.Fprintln(os.Stderr, "Please provide at least one song.")
+		flag.Usage()
+		os.Exit(1)
+	}
+	if len(OutputFilename) <= 0 {
+		fmt.Fprintln(os.Stderr, "Please provide a valid output filename.")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	for _, songFilename := range flag.Args() {
 		songReader, err := os.Open(songFilename)
 		if err != nil {
 			panic(err)
@@ -330,7 +441,7 @@ func main() {
 	}
 
 	// emit song and sample data
-	songWriter, err := os.Create("output.bin")
+	songWriter, err := os.Create(OutputFilename)
 	if err != nil {
 		panic(err)
 	}
@@ -342,16 +453,34 @@ func main() {
 		songWriter.Write([]byte{0, 0, 0})
 		position += 3
 	}
-	// write all sample data
-	for _, sample := range data.Samples {
-		sample.FilePosition = position
-		if sample.FilePosition+uint32(len(sample.Data)) > 65536 {
-			panic(fmt.Errorf("sample data bank too big :-("))
+	if BuildTestROM {
+		songWriter.Write([]byte{0xFF, 0xFF, 0xFF})
+		position += 3
+	}
+	if !DisablePCM {
+		// write all sample data
+		for i, sample := range data.Samples {
+			found := false
+			for j := 0; j < i; j++ {
+				otherSample := data.Samples[j]
+				if reflect.DeepEqual(sample.Data, otherSample.Data) {
+					sample.FilePosition = otherSample.FilePosition
+					found = true
+					break
+				}
+			}
+			if !found {
+				sample.FilePosition = position
+				if sample.FilePosition+uint32(len(*sample.Data)) > 65536 {
+					panic(fmt.Errorf("sample data bank too big :-("))
+				}
+				songWriter.Write(*sample.Data)
+				position += uint32(len(*sample.Data))
+			}
 		}
-		songWriter.Write(sample.Data)
-		position += uint32(len(sample.Data))
 	}
 	// start writing song data
+	wavetableCache := make(map[[16]byte]uint16)
 	for i := 0; i < len(data.Songs); i++ {
 		song := data.Songs[i]
 		loopPosition := position
@@ -370,6 +499,15 @@ func main() {
 					panic(fmt.Errorf("unknown port write data length %+v", cmd))
 				}
 			case *CommandWriteMemory:
+				if (cmd.Address&0x000F) == 0 && cmd.Address < 0x40 && len(cmd.Data) == 16 && (position&0xFFFF) < 0xFFE8 {
+					key := *(*[16]byte)(cmd.Data)
+					if pos, ok := wavetableCache[key]; ok {
+						cmdBuffer = append(cmdBuffer, uint8(0xFC+(cmd.Address>>4)), uint8(pos), uint8(pos>>8))
+						break
+					} else {
+						wavetableCache[key] = uint16(position + 2)
+					}
+				}
 				cmdBuffer = append(cmdBuffer, append([]byte{uint8(cmd.Address), uint8(len(cmd.Data))}, cmd.Data...)...)
 			case *CommandWait:
 				if cmd.Length >= 256 {
@@ -389,7 +527,7 @@ func main() {
 				} else {
 					ctrl := uint8(0x80)
 					pos := uint16(cmd.Sample.FilePosition)
-					len := uint16(len(cmd.Sample.Data))
+					len := uint16(len(*cmd.Sample.Data))
 					if cmd.Reverse {
 						pos += len - 1
 						ctrl |= 0x40
@@ -423,6 +561,7 @@ func main() {
 					songWriter.Write([]byte{0xFF})
 					position += 1
 				}
+				wavetableCache = make(map[[16]byte]uint16)
 			}
 			songWriter.Write(cmdBuffer)
 			filePos, _ := songWriter.Seek(0, io.SeekCurrent)
@@ -430,5 +569,37 @@ func main() {
 		}
 		songWriter.Write([]byte{0xFA})
 		writeBankPosition(songWriter, position, loopPosition)
+	}
+
+	if BuildTestROM {
+		// read all written data so far (to calculate checksum)
+		filePos, _ := songWriter.Seek(0, io.SeekCurrent)
+		fileData := make([]byte, filePos)
+		songWriter.Seek(0, io.SeekStart)
+		songWriter.Read(fileData)
+		checksum := uint16(0)
+		for _, d := range fileData {
+			checksum += uint16(d)
+		}
+		fileTargetSize := 131072
+		for fileTargetSize < (len(engineBin) + len(fileData)) {
+			fileTargetSize *= 2
+		}
+		engineBin[len(engineBin)-6] = romSizeToHeaderValue[fileTargetSize]
+
+		// calculate checksum remainder
+		for i := 0; i < len(engineBin)-2; i++ {
+			checksum += uint16(engineBin[i])
+		}
+		padByte := []byte{0xFF}
+		padByteCount := fileTargetSize - len(engineBin) - len(fileData)
+		checksum += uint16(uint64(padByteCount) * uint64(padByte[0]))
+		engineBin[len(engineBin)-2] = uint8(checksum)
+		engineBin[len(engineBin)-1] = uint8(checksum >> 8)
+
+		for i := 0; i < padByteCount; i++ {
+			songWriter.Write(padByte)
+		}
+		songWriter.Write(engineBin)
 	}
 }
