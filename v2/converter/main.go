@@ -37,8 +37,10 @@ import (
 var Emit0xFC = true
 var Emit0xEF = true
 var Enable24KHzSamples = false
+var HBlankTiming = true
 var DisablePCM = false
 var DisableResampling = false
+var OneSongMode = false
 var BuildTestROM = false
 var OutputFilename = ""
 
@@ -425,6 +427,9 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 		if newSamplePos > samplePos {
 			// TODO: support vblank mode
 			waitTime := ((newSamplePos-samplePos)*120 + 440) / 441
+			if !HBlankTiming {
+				waitTime = (waitTime + 158) / 159
+			}
 			if waitTime > 0 {
 				frame.Commands = append(frame.Commands, &CommandWait{
 					waitTime,
@@ -445,15 +450,22 @@ func parseVGM(r io.ReadSeeker) (*Song, error) {
 
 func writeBankPosition(w io.Writer, currentPosition uint32, writtenPosition uint32) error {
 	pos := uint16(writtenPosition & 0xFFFF)
-	bank := uint8(((writtenPosition & 0xFF0000) - (currentPosition & 0xFF0000)) >> 16)
-	_, err := w.Write([]byte{uint8(pos), uint8(pos >> 8), bank})
-	return err
+	if OneSongMode {
+		_, err := w.Write([]byte{uint8(pos), uint8(pos >> 8)})
+		return err
+	} else {
+		bank := uint8(((writtenPosition & 0xFF0000) - (currentPosition & 0xFF0000)) >> 16)
+		_, err := w.Write([]byte{uint8(pos), uint8(pos >> 8), bank})
+		return err
+	}
 }
 
 func init() {
 	flag.BoolVar(&DisablePCM, "disable-pcm", false, "Disable PCM samples.")
 	flag.BoolVar(&DisableResampling, "disable-resampling", false, "Disable resampling.")
 	flag.BoolVar(&Enable24KHzSamples, "enable-24khz-samples", false, "Enable 24kHz samples.")
+	flag.BoolVar(&HBlankTiming, "hblank-timing", false, "Time to HBlank instead of VBlank.")
+	flag.BoolVar(&OneSongMode, "one-song", false, "Do not emit song list at the beginning; do not split across multiple banks.")
 	flag.BoolVar(&BuildTestROM, "t", false, "Output playback ROM.")
 	flag.StringVar(&OutputFilename, "o", "", "Output filename.")
 }
@@ -471,6 +483,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Please provide a valid output filename.")
 		flag.Usage()
 		os.Exit(1)
+	}
+	if BuildTestROM {
+		// TODO: Remove this requirement.
+		HBlankTiming = true
 	}
 
 	for _, songFilename := range flag.Args() {
@@ -507,6 +523,11 @@ func main() {
 		}
 	}
 
+	if OneSongMode && len(data.Songs) != 1 {
+		fmt.Fprintln(os.Stderr, "Please provide only one input song in this mode.")
+		os.Exit(1)
+	}
+
 	// emit song and sample data
 	songWriter, err := os.Create(OutputFilename)
 	if err != nil {
@@ -516,13 +537,15 @@ func main() {
 
 	position := uint32(0)
 	// write empty song pointers for now
-	for i := 0; i < len(data.Songs); i++ {
-		songWriter.Write([]byte{0, 0, 0})
-		position += 3
-	}
-	if BuildTestROM {
-		songWriter.Write([]byte{0xFF, 0xFF, 0xFF})
-		position += 3
+	if !OneSongMode {
+		for i := 0; i < len(data.Songs); i++ {
+			songWriter.Write([]byte{0, 0, 0})
+			position += 3
+		}
+		if BuildTestROM {
+			songWriter.Write([]byte{0xFF, 0xFF, 0xFF})
+			position += 3
+		}
 	}
 	if !DisablePCM {
 		// write all sample data
@@ -569,8 +592,10 @@ func main() {
 	for i := 0; i < len(data.Songs); i++ {
 		song := data.Songs[i]
 		loopPosition := position
-		songWriter.Seek(int64(i*3), io.SeekStart)
-		writeBankPosition(songWriter, 0, position)
+		if !OneSongMode {
+			songWriter.Seek(int64(i*3), io.SeekStart)
+			writeBankPosition(songWriter, 0, position)
+		}
 		songWriter.Seek(int64(position), io.SeekStart)
 
 		for _, frame := range song.Commands {
